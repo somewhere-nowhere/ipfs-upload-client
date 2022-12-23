@@ -25,6 +25,7 @@ import (
 )
 
 const infuraAPI = "https://ipfs.infura.io:5001"
+const MAX_CONCURRENT_JOBS = 8
 
 type Metadata struct {
 	Image string `json:"image"`
@@ -99,8 +100,11 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(len(files))
 
+	waitChan := make(chan struct{}, MAX_CONCURRENT_JOBS)
+
 	for _, file := range files {
-		_, _ = fmt.Fprintln(os.Stdout, file.Name())
+		waitChan <- struct{}{}
+
 		go func(file fs.FileInfo) {
 			if !file.IsDir() {
 				fullPath := filepath.Join(path, file.Name())
@@ -109,6 +113,7 @@ func main() {
 				if err != nil {
 					_, _ = fmt.Fprintln(os.Stderr, err)
 					wg.Done()
+					<-waitChan
 					return
 				}
 
@@ -118,6 +123,7 @@ func main() {
 				if err != nil {
 					_, _ = fmt.Fprintln(os.Stderr, err)
 					wg.Done()
+					<-waitChan
 					return
 				}
 
@@ -125,18 +131,26 @@ func main() {
 				if err != nil {
 					_, _ = fmt.Fprintln(os.Stderr, err)
 					wg.Done()
+					<-waitChan
 					return
 				}
 
 				var res ipfsPath.Resolved
 				res, err = client.Unixfs().Add(ctx, ipfsFile, caopts.Unixfs.Pin(*pin), caopts.Unixfs.Progress(true))
 
+				if err != nil {
+					_, _ = fmt.Fprintln(os.Stderr, err)
+					wg.Done()
+					<-waitChan
+					return
+				}
+
 				cid := res.Cid().String()
 				a[index - 1] = cid
 
 				if *jsonPath != "" {
 					data := Metadata{
-						Image: filepath.Join(*urlPrefix, cid),
+						Image: *urlPrefix + cid,
 					}
 					jsonFile, _ := json.MarshalIndent(data, "", "  ")
 					_ = ioutil.WriteFile(filepath.Join(*jsonPath, shortFileName + ".json"), jsonFile, 0644)
@@ -148,6 +162,7 @@ func main() {
 			}
 
 			wg.Done()
+			<-waitChan
 		}(file)
 	}
 
