@@ -1,4 +1,4 @@
-module github.com/INFURA/ipfs-upload-client
+module ipfs-upload-client-images
 
 go 1.15
 

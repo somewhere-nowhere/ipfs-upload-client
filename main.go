@@ -3,15 +3,22 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io/fs"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	ipfsFiles "github.com/ipfs/go-ipfs-files"
 	httpapi "github.com/ipfs/go-ipfs-http-client"
-	coreiface "github.com/ipfs/interface-go-ipfs-core"
 	caopts "github.com/ipfs/interface-go-ipfs-core/options"
 	ipfsPath "github.com/ipfs/interface-go-ipfs-core/path"
 	flag "github.com/spf13/pflag"
@@ -19,12 +26,21 @@ import (
 
 const infuraAPI = "https://ipfs.infura.io:5001"
 
+type Metadata struct {
+	Image string `json:"image"`
+}
+
+func fileNameWithoutExt(fileName string) string {
+	return strings.TrimSuffix(fileName, filepath.Ext(fileName))
+}
+
 func main() {
 	projectId := flag.String("id", "", "your Infura ProjectID")
 	projectSecret := flag.String("secret", "", "your Infura ProjectSecret")
 	api := flag.String("url", infuraAPI, "the API URL")
 	pin := flag.Bool("pin", true, "whether or not to pin the data")
-	verbose := flag.Bool("verbose", false, "whether or not to print full upload information")
+	urlPrefix := flag.String("prefix", "", "path to prepend to ipfs hash")
+	jsonPath := flag.String("out", "", "where to save json files")
 
 	flag.Parse()
 
@@ -52,19 +68,6 @@ func main() {
 	}
 	path := args[0]
 
-	stat, err := os.Lstat(path)
-	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	// also support directory
-	file, err := ipfsFiles.NewSerialFile(path, false, stat)
-	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
 	// trap Ctrl+C and call cancel on the context
 	ctx, cancel := context.WithCancel(context.Background())
 	c := make(chan os.Signal, 1)
@@ -81,39 +84,75 @@ func main() {
 		}
 	}()
 
-	var res ipfsPath.Resolved
-	errCh := make(chan error, 1)
-	events := make(chan interface{}, 8)
 	start := time.Now()
 
-	go func() {
-		var err error
-		defer close(events)
-		res, err = client.Unixfs().Add(ctx, file, caopts.Unixfs.Pin(*pin), caopts.Unixfs.Progress(true), caopts.Unixfs.Events(events))
-		errCh <- err
-	}()
-
-	for event := range events {
-		output, ok := event.(*coreiface.AddEvent)
-		if !ok {
-			panic("unknown event type")
-		}
-
-		if output.Path != nil && output.Name != "" {
-			if *verbose {
-				_, _ = fmt.Fprintln(os.Stderr, fmt.Sprintf("Added %v %v | Bytes: %v | Size: %v", output.Name, output.Path, output.Bytes, output.Size))
-			} else {
-				_, _ = fmt.Fprintln(os.Stderr, fmt.Sprintf("Added %v", output.Name))
-			}
-		}
-	}
-
-	if err := <-errCh; err != nil {
+	// List files in directory
+	files, err := ioutil.ReadDir(path)
+	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
-		exit(start, 1)
+		os.Exit(1)
 	}
 
-	_, _ = fmt.Fprintln(os.Stdout, res.Cid().String())
+	var a [3333]string
+	var counter int64
+
+	var wg sync.WaitGroup
+	wg.Add(len(files))
+
+	for _, file := range files {
+		_, _ = fmt.Fprintln(os.Stdout, file.Name())
+		go func(file fs.FileInfo) {
+			if !file.IsDir() {
+				fullPath := filepath.Join(path, file.Name())
+
+				stat, err := os.Lstat(fullPath)
+				if err != nil {
+					_, _ = fmt.Fprintln(os.Stderr, err)
+					wg.Done()
+					return
+				}
+
+				fileName := stat.Name()
+				shortFileName := fileNameWithoutExt(fileName)
+				index, err := strconv.Atoi(shortFileName)
+				if err != nil {
+					_, _ = fmt.Fprintln(os.Stderr, err)
+					wg.Done()
+					return
+				}
+
+				ipfsFile, err := ipfsFiles.NewSerialFile(fullPath, false, stat)
+				if err != nil {
+					_, _ = fmt.Fprintln(os.Stderr, err)
+					wg.Done()
+					return
+				}
+
+				var res ipfsPath.Resolved
+				res, err = client.Unixfs().Add(ctx, ipfsFile, caopts.Unixfs.Pin(*pin), caopts.Unixfs.Progress(true))
+
+				cid := res.Cid().String()
+				a[index - 1] = cid
+
+				if *jsonPath != "" {
+					data := Metadata{
+						Image: filepath.Join(*urlPrefix, cid),
+					}
+					jsonFile, _ := json.MarshalIndent(data, "", "  ")
+					_ = ioutil.WriteFile(filepath.Join(*jsonPath, shortFileName + ".json"), jsonFile, 0644)
+				}
+
+				count := atomic.AddInt64(&counter, 1)
+
+				_, _ = fmt.Fprintln(os.Stdout, count, index, cid)
+			}
+
+			wg.Done()
+		}(file)
+	}
+
+	wg.Wait()
+
 	exit(start, 0)
 }
 
